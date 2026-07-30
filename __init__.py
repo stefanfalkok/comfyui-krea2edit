@@ -3,15 +3,10 @@
 ComfyUI's native Krea2 `_forward` is text-to-image only: it builds the sequence
 `[text | target]`. The krea2_edit LoRA (trained in ai-toolkit) needs the *appearance
 path*: the VAE-encoded SOURCE latent prepended as a block of clean tokens, distinguished
-from the (noisy) target purely by the 3-axis RoPE frame index (source=1, target=0, h/w
+from the (noisy) target purely by the 3-axis RoPE frame index (source=1..N, target=0, h/w
 aligned). This node adds that by wrapping the model's DIFFUSION_MODEL forward and rebuilding
-the sequence as `[text | source(frame=1) | target(frame=0)]`, keeping only the target tokens
+the sequence as `[text | sources(frame=1..N) | target(frame=0)]`, keeping only the target tokens
 out — mirroring ai-toolkit's `predict_velocity_edit` exactly, using the model's own submodules.
-
-Wiring:  LoadImage -> VAEEncode(source) --\
-                                            Krea2EditModelPatch(model, source_latent) -> KSampler
-         UNETLoader -> LoraLoaderModelOnly -/
-KSampler.latent_image <- EmptySD3LatentImage (noise). Text: NATIVE krea2 CLIP + CLIPTextEncode.
 """
 import math
 
@@ -23,8 +18,6 @@ import comfy.patcher_extension
 import comfy.utils
 import comfy.ldm.common_dit
 from comfy.ldm.flux.layers import timestep_embedding
-from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
 
 
 def _imgids(bs, frame, h_, w_, device):
@@ -36,7 +29,12 @@ def _imgids(bs, frame, h_, w_, device):
 
 
 def _imgids_offset(bs, frame, gh, gw, th, tw, device):
-    off_h, off_w = max(0, (th - gh) // 2), max(0, (tw - gw) // 2)
+    """Stride-1 integer positions at a centered continuous offset.
+
+    Fractional center: integer floor placed odd-gap refs 8px off their true center.
+    RoPE is continuous, so half-token positions are exact.
+    """
+    off_h, off_w = max(0.0, (th - gh) / 2.0), max(0.0, (tw - gw) / 2.0)
     ids = torch.zeros(gh, gw, 3, device=device, dtype=torch.float32)
     ids[..., 0] = frame
     ids[..., 1] = (torch.arange(gh, device=device, dtype=torch.float32) + off_h)[:, None]
@@ -62,7 +60,7 @@ def _fit_src(src, H, W):
     return F.interpolate(src.float(), size=(H, W), mode="bilinear")
 
 
-def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
+def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="fit"):
     key = key + (fit_mode,)
     if key in cache:
         return cache[key]
@@ -70,6 +68,7 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
     px_h, px_w = H * 8, W * 8
     img = image.movedim(-1, 1)  # B,H,W,C -> B,C,H,W
     ih, iw = img.shape[-2:]
+
     if fit_mode == "fit":
         sc = min(px_h / ih, px_w / iw)
         CROP_TOL = 0.08
@@ -82,11 +81,17 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
         else:
             nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
             nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
+            # CROP-TO-GRID: Prevent content squashing by cropping to exact grid scale
+            ch2, cw2 = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
+            y0, x0 = (ih - ch2) // 2, (iw - cw2) // 2
+            img = img[..., y0:y0 + ch2, x0:x0 + cw2]
+
         img = F.interpolate(img.float(), size=(nh, nw), mode="bicubic", antialias=True)
         lat = vae.encode(img.movedim(1, -1)[..., :3].clamp(0, 1))
         cache[key] = lat
         return lat
 
+    # Crop mode (legacy)
     s = max(px_h / ih, px_w / iw)
     ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
     y0, x0 = (ih - ch) // 2, (iw - cw) // 2
@@ -105,13 +110,15 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     rows0 = offs[-1]
     L = rows0 + tgtlen
     bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
+
     for i, b in enumerate(boosts):
         if i >= nsrc:
             break
-        # Защита от NaN или кривых значений
         if b is None or math.isnan(b) or b == 1.0:
             continue
         off, sl = offs[i], slens[i]
+
+        # Apply boost_mask to the last reference if present
         if boost_mask is not None and i == nsrc - 1 and mask_hw is not None:
             mask = boost_mask[:1]
             if mask.ndim == 2:
@@ -120,15 +127,18 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
             cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
         else:
             cols = torch.arange(off, off + sl, device=device)
+
         bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
     return bias
 
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
-                       ref_boosts=[1.0], ref_boost_mask=None,
+                       ref_boosts=None, ref_boost_mask=None,
                        ref_native=False, pos_mode="anchor"):
-    patch = m.patch
+    if ref_boosts is None:
+        ref_boosts = [1.0]
 
+    patch = m.patch
     temporal = x.ndim == 5
     if temporal:
         b5, c5, t5, h5, w5 = x.shape
@@ -174,6 +184,7 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
                    for i, (gh, gw) in enumerate(src_grids)]
     else:
         ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
+
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]
         + ref_ids
@@ -182,7 +193,6 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     freqs = m.pe_embedder(pos)
 
     attn_bias = None
-    # Проверяем валидность каждого значения в ref_boosts
     clean_boosts = [1.0 if (b is None or math.isnan(b)) else b for b in ref_boosts]
     if any(b != 1.0 for b in clean_boosts):
         attn_bias = _ref_attn_bias(clean_boosts, ref_boost_mask, txtlen,
@@ -219,13 +229,14 @@ class Krea2EditModelPatch:
             "ref_boost_d": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001, "tooltip": "Boost for 4th reference"}),
             "ref_boost_e": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001, "tooltip": "Boost for 5th reference"}),
             "fit_mode": (["fit", "crop (legacy)"], {"default": "fit"}),
-            "ref_boost_mask": ("MASK",),
-            "vae": ("VAE",),
+            "ref_boost_mask": ("MASK", {"tooltip": "Region on the last active reference to boost"}),
+            "vae": ("VAE", {"tooltip": "RECOMMENDED with source_image: blur-proof pixel-space path"}),
             "source_image": ("IMAGE", {"tooltip": "1st reference as IMAGE"}),
             "source_image_b": ("IMAGE", {"tooltip": "2nd reference as IMAGE"}),
             "source_image_c": ("IMAGE", {"tooltip": "3rd reference as IMAGE"}),
             "source_image_d": ("IMAGE", {"tooltip": "4th reference as IMAGE"}),
             "source_image_e": ("IMAGE", {"tooltip": "5th reference as IMAGE"}),
+            "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image to prevent VRAM model eviction mid-sampling"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -233,41 +244,58 @@ class Krea2EditModelPatch:
     CATEGORY = "krea2edit"
     DESCRIPTION = "Adds the krea2_edit in-context source-preservation path to a Krea2 model (supports up to 5 references)."
 
-    def patch(self, model, source_latent=None, source_latent_b=None, source_latent_c=None, 
+    def patch(self, model, source_latent=None, source_latent_b=None, source_latent_c=None,
               source_latent_d=None, source_latent_e=None, ref_boost=1.0, ref_boost_b=1.0,
               ref_boost_c=1.0, ref_boost_d=1.0, ref_boost_e=1.0,
-              ref_boost_mask=None, vae=None, source_image=None, source_image_b=None, 
-              source_image_c=None, source_image_d=None, source_image_e=None, 
-              fit_mode="fit", **_future):
-        
+              ref_boost_mask=None, vae=None, source_image=None, source_image_b=None,
+              source_image_c=None, source_image_d=None, source_image_e=None,
+              fit_mode="fit", target_latent=None, **_future):
+
         m = model.clone()
         mm = model.model
 
+        # Collect latents
         lats_raw = [source_latent, source_latent_b, source_latent_c, source_latent_d, source_latent_e]
-        lats_raw = [l for l in lats_raw if l is not None]
+        active_lats = [l for l in lats_raw if l is not None]
 
         src_samples = []
-        for l in lats_raw:
+        for l in active_lats:
             src_samples.append(mm.process_latent_in(l["samples"]))
         if len(src_samples) == 1:
             src_samples = src_samples[0]
 
-        imgs_raw = [source_image, source_image_b, source_image_c, source_image_d, source_image_e]
-        imgs_raw = [i for i in imgs_raw if i is not None]
-
-        # Безопасная фильтрация и присвоение бустов
-        def _clean_val(v):
-            return 1.0 if (v is None or math.isnan(v)) else v
-
-        ref_boosts = [
-            _clean_val(ref_boost),
-            _clean_val(ref_boost_b),
-            _clean_val(ref_boost_c),
-            _clean_val(ref_boost_d),
-            _clean_val(ref_boost_e),
+        # Collect images & matching boosts
+        raw_inputs = [
+            (source_image, ref_boost),
+            (source_image_b, ref_boost_b),
+            (source_image_c, ref_boost_c),
+            (source_image_d, ref_boost_d),
+            (source_image_e, ref_boost_e),
         ]
 
+        active_imgs = []
+        active_boosts = []
+        for img, boost in raw_inputs:
+            if img is not None or len(active_lats) > 0:
+                b_val = 1.0 if (boost is None or math.isnan(boost)) else boost
+                active_boosts.append(b_val)
+                if img is not None:
+                    active_imgs.append(img)
+
         px_cache = {}
+        state = {"announced": False}
+
+        # Pre-encode outside sampling loop (restores VRAM management)
+        primed = None
+        if vae is not None and len(active_imgs) > 0:
+            if target_latent is not None:
+                Hh, Ww = target_latent["samples"].shape[-2], target_latent["samples"].shape[-1]
+                print(f"[krea2edit] pre-encoding {len(active_imgs)} sources at target {Hh * 8}x{Ww * 8}px (fit_mode={fit_mode})", flush=True)
+                for idx, img in enumerate(active_imgs):
+                    _fit_encode_image(img, vae, Hh, Ww, px_cache, (f"ref_{idx}", Hh, Ww), fit_mode)
+                primed = (Hh, Ww)
+            else:
+                print("[krea2edit] NOTE: connect 'target_latent' to pre-encode sources before sampling and avoid VRAM thrashing.", flush=True)
 
         def wrapper(executor, x, timesteps, context, *wargs, **kwargs):
             transformer_options = kwargs.pop("transformer_options", None)
@@ -280,19 +308,25 @@ class Krea2EditModelPatch:
             dm = executor.class_obj
             src = src_samples
 
-            if vae is not None and len(imgs_raw) > 0:
+            if vae is not None and len(active_imgs) > 0:
                 xx = _to_4d(x)
                 Hh, Ww = xx.shape[-2], xx.shape[-1]
+                if not state["announced"]:
+                    state["announced"] = True
+                    print(f"[krea2edit] pixel path ACTIVE ({len(active_imgs)} refs, fit_mode={fit_mode})", flush=True)
+                    if primed is not None and primed != (Hh, Ww):
+                        print(f"[krea2edit] WARNING: 'target_latent' pre-encode misaligned with sampling resolution ({primed} vs {Hh},{Ww}).", flush=True)
+
                 encoded_list = []
-                for idx, img in enumerate(imgs_raw):
+                for idx, img in enumerate(active_imgs):
                     encoded = _fit_encode_image(img, vae, Hh, Ww, px_cache, (f"ref_{idx}", Hh, Ww), fit_mode)
                     encoded_list.append(mm.process_latent_in(encoded))
                 src = encoded_list if len(encoded_list) > 1 else encoded_list[0]
 
             v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
-                                   ref_boosts=ref_boosts,
+                                   ref_boosts=active_boosts,
                                    ref_boost_mask=ref_boost_mask,
-                                   ref_native=(fit_mode == "fit" and vae is not None and len(imgs_raw) > 0),
+                                   ref_native=(fit_mode == "fit" and vae is not None and len(active_imgs) > 0),
                                    pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
             return v
 
@@ -347,9 +381,9 @@ class Krea2EditGroundedEncode:
             samples = comfy.utils.common_upscale(samples, round(w * s), round(h * s), "area", "disabled")
         return samples.movedim(1, -1)[:, :, :, :3]
 
-    def encode(self, clip, prompt, image=None, image_b=None, image_c=None, 
+    def encode(self, clip, prompt, image=None, image_b=None, image_c=None,
                image_d=None, image_e=None, grounding_px=768, system_prompt="", **_future):
-        
+
         raw_imgs = [image, image_b, image_c, image_d, image_e]
         raw_imgs = [i for i in raw_imgs if i is not None]
 
@@ -384,4 +418,4 @@ def _pack_version():
         return "unknown"
 
 
-print(f"[krea2edit] nodes v{_pack_version()} loaded (5-ref edit fixed)", flush=True)
+print(f"[krea2edit] nodes v{_pack_version()} loaded (5-ref multi-input with pre-encode)", flush=True)
