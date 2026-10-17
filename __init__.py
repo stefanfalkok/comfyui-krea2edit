@@ -42,6 +42,31 @@ def _imgids_offset(bs, frame, gh, gw, th, tw, device):
     return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
 
 
+REF_POSITIONS = ["aligned (trained)", "beside (right of target)", "bag of features"]
+
+
+def _place_refs(ref_ids, modes, h_, w_):
+    """Reference placement on the h/w RoPE axes (frame axis untouched: refs keep 1..N)."""
+    if isinstance(modes, str):
+        modes = [modes] * len(ref_ids)
+    out, x0 = [], float(w_)
+    for ids, mode in zip(ref_ids, modes):
+        if mode.startswith("aligned"):
+            out.append(ids)
+            continue
+        ids = ids.clone()
+        if mode.startswith("beside"):
+            ids[..., 2] = ids[..., 2] - ids[..., 2].min() + x0
+            x0 = float(ids[..., 2].max()) + 1.0
+        elif mode.startswith("bag"):
+            ids[..., 1] = (h_ - 1) / 2.0
+            ids[..., 2] = (w_ - 1) / 2.0
+        else:
+            raise ValueError(f"unknown ref_position {mode!r}")
+        out.append(ids)
+    return out
+
+
 def _to_4d(v):
     if v.ndim == 5:
         b, c, t, h, w = v.shape
@@ -81,10 +106,9 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="fit"):
         else:
             nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
             nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
-            # CROP-TO-GRID: Prevent content squashing by cropping to exact grid scale
             ch2, cw2 = min(ih, max(1, int(round(nh / sc)))), min(iw, max(1, int(round(nw / sc))))
             y0, x0 = (ih - ch2) // 2, (iw - cw2) // 2
-            img = img[..., y0:y0 + ch2, x0:x0 + cw2]
+            img = img[..., y0:y0 + ch2, x0:x0 + ch2]
 
         img = F.interpolate(img.float(), size=(nh, nw), mode="bicubic", antialias=True)
         lat = vae.encode(img.movedim(1, -1)[..., :3].clamp(0, 1))
@@ -118,7 +142,6 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
             continue
         off, sl = offs[i], slens[i]
 
-        # Apply boost_mask to the last reference if present
         if boost_mask is not None and i == nsrc - 1 and mask_hw is not None:
             mask = boost_mask[:1]
             if mask.ndim == 2:
@@ -134,7 +157,8 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boosts=None, ref_boost_mask=None,
-                       ref_native=False, pos_mode="anchor"):
+                       ref_native=False, pos_mode="anchor",
+                       ref_positions=None):
     if ref_boosts is None:
         ref_boosts = [1.0]
 
@@ -184,6 +208,11 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
                    for i, (gh, gw) in enumerate(src_grids)]
     else:
         ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
+
+    # Применяем позиции для активных референсов
+    if ref_positions is not None:
+        modes = ref_positions[:len(ref_ids)]
+        ref_ids = _place_refs(ref_ids, modes, h_, w_)
 
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]
@@ -236,7 +265,12 @@ class Krea2EditModelPatch:
             "source_image_c": ("IMAGE", {"tooltip": "3rd reference as IMAGE"}),
             "source_image_d": ("IMAGE", {"tooltip": "4th reference as IMAGE"}),
             "source_image_e": ("IMAGE", {"tooltip": "5th reference as IMAGE"}),
-            "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image to prevent VRAM model eviction mid-sampling"}),
+            "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image"}),
+            "ref_position": (REF_POSITIONS, {"default": REF_POSITIONS[0], "tooltip": "Placement for 1st reference"}),
+            "ref_position_b": (REF_POSITIONS, {"default": REF_POSITIONS[0], "tooltip": "Placement for 2nd reference"}),
+            "ref_position_c": (REF_POSITIONS, {"default": REF_POSITIONS[0], "tooltip": "Placement for 3rd reference"}),
+            "ref_position_d": (REF_POSITIONS, {"default": REF_POSITIONS[0], "tooltip": "Placement for 4th reference"}),
+            "ref_position_e": (REF_POSITIONS, {"default": REF_POSITIONS[0], "tooltip": "Placement for 5th reference"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -249,7 +283,17 @@ class Krea2EditModelPatch:
               ref_boost_c=1.0, ref_boost_d=1.0, ref_boost_e=1.0,
               ref_boost_mask=None, vae=None, source_image=None, source_image_b=None,
               source_image_c=None, source_image_d=None, source_image_e=None,
-              fit_mode="fit", target_latent=None, **_future):
+              fit_mode="fit", target_latent=None,
+              ref_position="aligned (trained)", ref_position_b="aligned (trained)",
+              ref_position_c="aligned (trained)", ref_position_d="aligned (trained)",
+              ref_position_e="aligned (trained)", **_future):
+
+        # Обработка обратной совместимости для старого ref_position_a из воркфлоу на 2 референса
+        ref_position_a = _future.pop("ref_position_a", None)
+
+        if _future:
+            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
+                  f"know ({', '.join(sorted(_future))}). Continuing without them.", flush=True)
 
         m = model.clone()
         mm = model.model
@@ -264,28 +308,41 @@ class Krea2EditModelPatch:
         if len(src_samples) == 1:
             src_samples = src_samples[0]
 
-        # Collect images & matching boosts
+        # Collect inputs & positions
         raw_inputs = [
-            (source_image, ref_boost),
-            (source_image_b, ref_boost_b),
-            (source_image_c, ref_boost_c),
-            (source_image_d, ref_boost_d),
-            (source_image_e, ref_boost_e),
+            (source_image, ref_boost, ref_position),
+            (source_image_b, ref_boost_b, ref_position_b),
+            (source_image_c, ref_boost_c, ref_position_c),
+            (source_image_d, ref_boost_d, ref_position_d),
+            (source_image_e, ref_boost_e, ref_position_e),
         ]
 
         active_imgs = []
         active_boosts = []
-        for img, boost in raw_inputs:
-            if img is not None or len(active_lats) > 0:
+        active_positions = []
+
+        for idx, (img, boost, pos) in enumerate(raw_inputs):
+            # Проверка, активен ли текущий слот (через image или latent)
+            is_active = (img is not None) or (idx < len(active_lats))
+            if is_active:
                 b_val = 1.0 if (boost is None or math.isnan(boost)) else boost
                 active_boosts.append(b_val)
+                active_positions.append(pos)
                 if img is not None:
                     active_imgs.append(img)
+
+        # Если использовался старый параметр ref_position_a, переназначаем позиции для ранних референсов
+        if ref_position_a is not None and len(active_positions) > 1:
+            for i in range(len(active_positions) - 1):
+                active_positions[i] = ref_position_a
 
         px_cache = {}
         state = {"announced": False}
 
-        # Pre-encode outside sampling loop (restores VRAM management)
+        if fit_mode == "fit" and (vae is None or len(active_imgs) == 0):
+            print(f"[krea2edit] WARNING: fit_mode='fit' has NO EFFECT without both 'vae' and 'source_image' connected. Falling back to latent path.", flush=True)
+
+        # Pre-encode outside sampling loop
         primed = None
         if vae is not None and len(active_imgs) > 0:
             if target_latent is not None:
@@ -327,7 +384,8 @@ class Krea2EditModelPatch:
                                    ref_boosts=active_boosts,
                                    ref_boost_mask=ref_boost_mask,
                                    ref_native=(fit_mode == "fit" and vae is not None and len(active_imgs) > 0),
-                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
+                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"),
+                                   ref_positions=active_positions)
             return v
 
         to = m.model_options.setdefault("transformer_options", {})
@@ -384,6 +442,10 @@ class Krea2EditGroundedEncode:
     def encode(self, clip, prompt, image=None, image_b=None, image_c=None,
                image_d=None, image_e=None, grounding_px=768, system_prompt="", **_future):
 
+        if _future:
+            print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
+                  f"know ({', '.join(sorted(_future))}). Continuing without them.", flush=True)
+
         raw_imgs = [image, image_b, image_c, image_d, image_e]
         raw_imgs = [i for i in raw_imgs if i is not None]
 
@@ -418,4 +480,4 @@ def _pack_version():
         return "unknown"
 
 
-print(f"[krea2edit] nodes v{_pack_version()} loaded (5-ref multi-input with pre-encode)", flush=True)
+print(f"[krea2edit] nodes v{_pack_version()} loaded (5-ref multi-input with individual ref_position)", flush=True)
