@@ -11,10 +11,15 @@ into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was t
 
 ☕ **[Support on Ko-fi](https://ko-fi.com/conradlocke)** — all tips go straight to GPU compute for future versions.
 
+🧰 **Training code is public:** [krea2edit-trainer](https://github.com/lbouaraba/krea2edit-trainer) — the ai-toolkit extension these LoRAs were trained with, geometry-matched to the nodes, with measured consumer-GPU VRAM requirements.
+
 ## Model versions
 
-See [CHANGELOG.md](CHANGELOG.md) — **v1.2 is recommended** (better face likeness,
-plus the new `fit` reference geometry and `ref_boost` fidelity dial).
+**V2 (recommended)** ships as two LoRAs — **Krea 2 Identity Edit V2**
+(`krea2_identity_edit_v2.safetensors`, restage a person from one photo) and **Krea 2 General
+Edit V2** (`krea2_general_edit_v2.safetensors`, instruction-based editing). Use one per task.
+The V2 nodes add **reference placement** (`ref_position` / `ref_position_a`). Older weights
+keep working with these nodes. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
 
@@ -26,7 +31,8 @@ git clone https://github.com/lbouaraba/comfyui-krea2edit
 
 Requirements: a ComfyUI version with native Krea 2 support, the Krea 2 model
 (Raw or Turbo), the Qwen3-VL 4B text encoder used by Krea 2, and the Krea 2 Identity Edit
-LoRA (`krea2_identity_edit_v1_2.safetensors`). No extra Python dependencies.
+LoRAs (`krea2_identity_edit_v2.safetensors` and/or `krea2_general_edit_v2.safetensors`).
+No extra Python dependencies.
 
 ## Nodes
 
@@ -40,11 +46,21 @@ in-context tokens (RoPE frame 1). Inputs:
 - `vae` + `source_image` *(optional, recommended)* — the blur-proof pixel path: give
   the raw image (and VAE) and the node fits it to the target grid in pixel space.
   Required for `fit_mode: fit`.
+- `target_latent` *(optional, recommended whenever you use the pixel path)* — wire the
+  **same** latent you feed `KSampler.latent_image`. It only tells the node the output
+  resolution ahead of time, so the source can be VAE-encoded here instead of on the first
+  sampling step. Skipping it can cost real speed — see [Pixel path and VRAM](#pixel-path-and-vram).
 - `fit_mode` *(default `fit`)* — how a source fits a mismatched output aspect ratio.
   `fit` = training-matched resample at a centered offset (v1.2); `crop` = center-crop,
   the v1/v1.1-legacy geometry (use with older weights).
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
+- `ref_position` *(default `aligned (trained)`)* — where the **last** reference (the person,
+  or the only image) sits in position space. `aligned` pins it onto the output layout (how the
+  models were trained); `beside (right of target)` places it next to the canvas, so identity
+  still flows but the layout pin is gone and the person can be restaged more freely;
+  `bag of features` is experimental. `ref_position_a` is the same choice for the **first**
+  reference (the scene). For putting a person into a scene: scene `aligned`, person `beside`.
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while
@@ -71,7 +87,8 @@ UNETLoader ── LoraLoaderModelOnly (krea2_identity_edit_v1_2 @1.0) ── Kre
 Krea2EditModelPatch ── KSampler.model
 Krea2EditGroundedEncode ── KSampler.positive
 Krea2EditGroundedEncode (empty prompt, same image) ── KSampler.negative
-EmptySD3LatentImage ── KSampler.latent_image
+EmptySD3LatentImage ─┬─ KSampler.latent_image
+                     └─ Krea2EditModelPatch.target_latent   (when using vae + source_image)
 ```
 
 Example workflow in `workflows/`: `krea2_identity_edit.json` — single-image editor by
@@ -98,6 +115,40 @@ default; enable group 2 (toggle its Bypass off) for two-image person-into-scene 
    the main inputs, subject B on the `_b` inputs) rather than adding them one at a time —
    simultaneous placement is currently more reliable than chaining separate edits. Face
    separation is still imperfect and a focus for future versions.
+8. **Wire `target_latent` if you use `vae` + `source_image`** — see below.
+
+## Pixel path and VRAM
+
+The pixel path has to VAE-encode the source at the output resolution. Without
+`target_latent` the node doesn't know that resolution until sampling starts, so the
+encode runs on the first step — and `vae.encode` asks ComfyUI for VRAM at a moment when
+the diffusion model is already resident and mid-run. ComfyUI frees room by partially
+offloading whatever is loaded, the sampler included, and nothing loads it back (it loads
+once, before its loop). The rest of the run then streams weights from CPU on every step.
+
+Wiring `target_latent` moves the encode to node-execution time, restoring the normal
+`VAEEncode → KSampler` order where the sampler evicts the VAE rather than the reverse.
+The encode is cached either way, so this is purely about *when* it happens.
+
+If you have VRAM headroom for the model and the VAE at once, nothing gets offloaded and
+neither wiring costs you anything — which is why this only bites some setups. Wire it
+anyway; it's free.
+
+The console tells you which path you got:
+
+```
+[krea2edit] pre-encoding sources at target 128x128 (before sampling, fit_mode=fit)   <- good
+[krea2edit] NOTE: connect 'target_latent' ...                                        <- encode will land mid-sampling
+```
+
+**Measure over 20+ steps, not 1.** The source still has to be VAE-encoded either way —
+`target_latent` only changes *when*. What it removes is a per-step penalty, so it can
+only show up across many steps. A 1-step run is almost entirely fixed overhead (model
+load, text encode, VAE encode/decode) and will show no difference at all.
+
+A third option is to skip the pixel path entirely: resize your source image to exactly
+the output resolution and feed only `source_latent`. At matched resolution the latent
+path does no resampling and produces the same reference geometry.
 
 ## License / credits
 
@@ -119,6 +170,8 @@ This is a solo project, made a lot better by the community. Thank you to:
 - **[SubtleShader](https://huggingface.co/SubtleShader)** — testing the training code and
   consumer-GPU feedback.
 - **Mark ([sogni.ai](https://sogni.ai))** — support, a GPU-fund donation, and getting the word out.
+- **[ethanfel](https://github.com/ethanfel)** — root-caused the pixel path's VRAM interaction with
+  the sampler and contributed the `target_latent` pre-encode (#15), tests included.
 
 Want to help? Contributions of training data and node/code work are welcome, see the discussions.
 
@@ -131,4 +184,3 @@ data in current or future versions.
 I do not endorse or support using this model to produce non-consensual, harmful, or sexual
 imagery of real people, including deepfakes. Please use it responsibly and respect the
 consent and likeness of anyone you depict.
-
