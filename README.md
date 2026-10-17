@@ -1,6 +1,6 @@
 It's modified node for krea2edit with 5 images references. Also I put modified workflow to work with 5 image references
 
-don't forget downloading **[Krea 2 General Lora]([https://civitai.red/models/2761113/krea-2-identity-edit?modelVersionId=3139172](https://civitai.red/models/2761113/krea-2-identity-edit?modelVersionId=3409322))** for correct edit working
+don't forget downloading **[Krea 2 General Lora]([https://civitai.red/models/2761113/krea-2-identity-edit?modelVersionId=3139172](https://civitai.red/models/2761113/krea-2-identity-edit?modelVersionId=3409322)** for correct edit working
 
 # ComfyUI-Krea2Edit
 
